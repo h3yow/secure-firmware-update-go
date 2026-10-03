@@ -1,6 +1,8 @@
 package device
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,8 +53,8 @@ func Open(dir, model string) (*Store, error) {
 	return s, nil
 }
 
-// Close releases the store.
-func (s *Store) Close() error { return nil }
+// Close releases the store and any update lock it holds.
+func (s *Store) Close() error { return s.Unlock() }
 
 func removeTemps(dir string) error {
 	entries, err := os.ReadDir(dir)
@@ -96,7 +98,102 @@ func (s *Store) loadOrInit(model string) error {
 		in.Slots = map[string]SlotState{}
 	}
 	s.inner = in
+	return s.reconcileLocked()
+}
+
+// reconcileLocked repairs state against the on-disk slot files after an
+// interrupted operation. It runs at every Open and is idempotent, so a power
+// loss during reconciliation itself is also safe.
+//
+// Invariant when no update is pending: the active slot runs the current
+// known-good version and its files are never written outside an atomic
+// pointer flip, so a mismatch there is fatal corruption. The inactive slot
+// holds at most one retained previous known-good version; chaining upgrades
+// overwrites it, and a crash mid-overwrite can leave files that no longer
+// match state.json. Such an inactive slot is discarded (files + state entry),
+// leaving the device booting a known-good version. Orphan slot files without
+// a state entry are removed as well.
+//
+// When an update is pending the inactive slot is either the protected
+// rollback target or a staged-not-activated image owned by RecoverOnBoot; it
+// is deliberately not reconciled here.
+func (s *Store) reconcileLocked() error {
+	if s.inner.Pending != nil {
+		return nil
+	}
+	active := s.inner.ActiveSlot
+	inactive := otherSlot(active)
+
+	if cur := s.inner.Slots[active]; cur.Present {
+		if err := checkSlotFiles(s.dir, active, cur); err != nil {
+			return fmt.Errorf("device: active slot %s damaged: %w", active, err)
+		}
+	}
+
+	dirty := false
+	if old := s.inner.Slots[inactive]; old.Present {
+		if err := checkSlotFiles(s.dir, inactive, old); err != nil {
+			// Retained slot was mid-overwrite when power was lost: drop it.
+			// The active known-good slot is untouched and remains bootable.
+			if rmErr := s.removeSlotFilesLocked(inactive); rmErr != nil {
+				return rmErr
+			}
+			delete(s.inner.Slots, inactive)
+			dirty = true
+		}
+	} else {
+		// Orphaned files from a stage that never reached state.json.
+		if removed, rmErr := removeSlotFilesIfExist(s.dir, inactive); rmErr != nil {
+			return rmErr
+		} else if removed {
+			// Files only: state did not reference them, no persist needed.
+		}
+	}
+	if dirty {
+		return s.persistLocked()
+	}
 	return nil
+}
+
+// checkSlotFiles verifies that a slot's metadata file and payload file exist
+// and match the recorded metadata (version plus payload SHA-256).
+func checkSlotFiles(dir, slot string, want SlotState) error {
+	metaPath := filepath.Join(dir, "slot-"+slot+".json")
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		return fmt.Errorf("read meta: %w", err)
+	}
+	var got SlotState
+	if err := json.Unmarshal(metaBytes, &got); err != nil {
+		return fmt.Errorf("parse meta: %w", err)
+	}
+	if !got.Present || got.Version != want.Version {
+		return fmt.Errorf("slot meta version mismatch: files=%d state=%d", got.Version, want.Version)
+	}
+	payload, err := os.ReadFile(filepath.Join(dir, "slot-"+slot+".bin"))
+	if err != nil {
+		return fmt.Errorf("read payload: %w", err)
+	}
+	sum := sha256.Sum256(payload)
+	if !bytes.Equal(sum[:], want.PayloadHash) {
+		return errors.New("slot payload hash mismatch")
+	}
+	return nil
+}
+
+// removeSlotFilesIfExist removes slot files that may be left over. It reports
+// whether at least one file was present.
+func removeSlotFilesIfExist(dir, slot string) (bool, error) {
+	removed := false
+	for _, suffix := range []string{".json", ".bin"} {
+		name := filepath.Join(dir, "slot-"+slot+suffix)
+		if err := os.Remove(name); err == nil {
+			removed = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return removed, nil
 }
 
 // persistLocked writes state atomically: temp file, fsync, rename. A crash at
@@ -131,9 +228,13 @@ func (s *Store) viewLocked() State {
 	out := State{
 		Model:     s.inner.Model,
 		Committed: s.inner.Slots[s.inner.ActiveSlot],
-		Staged:    s.inner.Slots[inactive],
 		Pending:   s.inner.Pending,
 		BootCount: s.inner.BootCount,
+	}
+	if s.inner.Pending != nil {
+		out.Staged = s.inner.Slots[inactive]
+	} else {
+		out.Retained = s.inner.Slots[inactive]
 	}
 	if out.Pending != nil {
 		p := *s.inner.Pending
@@ -149,9 +250,9 @@ func otherSlot(x string) string {
 	return slotA
 }
 
-// FactoryInit writes the initial known-good firmware into slot A. Only
-// allowed on a store without a committed image.
-func (s *Store) FactoryInit(init SlotState) error {
+// FactoryInit writes the initial known-good firmware (metadata and payload)
+// into slot A. Only allowed on a store without a committed image.
+func (s *Store) FactoryInit(init SlotState, payload []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cur := s.inner.Slots[s.inner.ActiveSlot]; cur.Present {
@@ -161,7 +262,7 @@ func (s *Store) FactoryInit(init SlotState) error {
 	if init.InstalledAt.IsZero() {
 		init.InstalledAt = time.Now().UTC()
 	}
-	if err := s.writeSlotFilesLocked(s.inner.ActiveSlot, init, nil, nil); err != nil {
+	if err := s.writeSlotFilesLocked(s.inner.ActiveSlot, init, payload, nil); err != nil {
 		return err
 	}
 	s.inner.Slots[s.inner.ActiveSlot] = init

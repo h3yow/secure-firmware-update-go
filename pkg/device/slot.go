@@ -86,9 +86,18 @@ func (s *Store) writeSlotFilesLocked(slot string, meta SlotState, payload []byte
 	return nil
 }
 
-// Stage writes the payload into the inactive slot. Re-staging the exact same
-// (version, hash) content is a successful no-op so retries are idempotent;
-// staging different content while an update is pending is rejected.
+// Stage writes the payload into the inactive slot.
+//
+// Retention policy: the device keeps at most two versions — the running
+// version in the active slot and one rollback-capable known-good version in
+// the inactive slot. When no update is pending, the inactive slot holds that
+// retained previous known-good version and a new update overwrites it
+// directly; this is what lets the device chain upgrades v1 -> v2 -> v3 ...
+// without ever accumulating more slots or requiring a wipe.
+//
+// Re-staging the exact same (version, hash) content while an update is
+// pending is a successful no-op so crash retries are idempotent; staging
+// different content while an update is pending is rejected.
 func (s *Store) Stage(meta SlotState, payload []byte, opts ...Option) error {
 	o := resolve(opts)
 	s.mu.Lock()
@@ -100,7 +109,7 @@ func (s *Store) Stage(meta SlotState, payload []byte, opts ...Option) error {
 	}
 	target := otherSlot(s.inner.ActiveSlot)
 
-	if existing := s.inner.Slots[target]; existing.Present {
+	if existing := s.inner.Slots[target]; existing.Present && s.inner.Pending != nil {
 		same := existing.Version == meta.Version && bytes.Equal(existing.PayloadHash, meta.PayloadHash)
 		if !same {
 			return fmt.Errorf("device: slot %s already holds version %d; reject conflicting stage of %d", target, existing.Version, meta.Version)
@@ -180,7 +189,12 @@ func (s *Store) Confirm(opts ...Option) error {
 }
 
 // Rollback restores the previous known-good slot atomically and clears the
-// staged trial. It is safe to call whether or not the trial was activated.
+// rollback state. It is safe to call whether or not the trial was activated.
+//
+// The retained previous known-good version lives in the other physical slot;
+// its files must survive (they are the rollback target), so the discarded
+// trial/staged content is identified by version identity rather than by slot
+// name.
 func (s *Store) Rollback(opts ...Option) error {
 	o := resolve(opts)
 	s.mu.Lock()
@@ -194,17 +208,60 @@ func (s *Store) Rollback(opts ...Option) error {
 		// known-good slot; just discard staging metadata.
 		s.inner.ActiveSlot = slotWithVersion(s.inner.Slots, s.inner.Pending.FromVersion, s.inner.ActiveSlot)
 	} else {
-		s.inner.ActiveSlot = otherSlot(s.inner.ActiveSlot)
+		s.inner.ActiveSlot = slotWithVersion(s.inner.Slots, s.inner.Pending.FromVersion, otherSlot(s.inner.ActiveSlot))
 	}
-	inactive := otherSlot(s.inner.ActiveSlot)
-	delete(s.inner.Slots, inactive)
-	if err := s.removeSlotFilesLocked(inactive); err != nil {
+	if err := discardVersionLocked(s, s.inner.Pending.ToVersion, s.inner.ActiveSlot); err != nil {
 		return err
 	}
 	if err := o.fire("rollback.state"); err != nil {
 		return err
 	}
 	s.inner.Pending = nil
+	s.inner.BootCount = 0
+	return s.persistLocked()
+}
+
+// discardVersionLocked removes slot state/files belonging to discardVersion,
+// skipping keepSlot (the active/known-good slot) and any slot that holds a
+// different version.
+func discardVersionLocked(s *Store, discardVersion uint64, keepSlot string) error {
+	for name, st := range s.inner.Slots {
+		if name == keepSlot || !st.Present || st.Version != discardVersion {
+			continue
+		}
+		if err := s.removeSlotFilesLocked(name); err != nil {
+			return err
+		}
+		delete(s.inner.Slots, name)
+	}
+	return nil
+}
+
+// RollbackRetained flips the boot pointer back to the retained previous
+// known-good version in the inactive slot. It applies when no trial update is
+// pending (the running version was already confirmed). The two slots simply
+// exchange roles: after the flip the formerly running version remains on
+// device as the retained rollback target, so capacity stays at two versions
+// and a second rollback is rejected without any state change.
+//
+// It returns ErrNotPending when there is no strictly older known-good version
+// retained to return to.
+func (s *Store) RollbackRetained(opts ...Option) error {
+	o := resolve(opts)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inner.Pending != nil {
+		return ErrNotPending
+	}
+	active := s.inner.Slots[s.inner.ActiveSlot]
+	retained := s.inner.Slots[otherSlot(s.inner.ActiveSlot)]
+	if !retained.Present || retained.Version >= active.Version {
+		return ErrNotPending
+	}
+	if err := o.fire("rollback.state"); err != nil {
+		return err
+	}
+	s.inner.ActiveSlot = otherSlot(s.inner.ActiveSlot)
 	s.inner.BootCount = 0
 	return s.persistLocked()
 }
@@ -242,10 +299,10 @@ func (s *Store) RecoverOnBoot(opts ...Option) (bool, error) {
 	}
 	active := s.inner.Slots[s.inner.ActiveSlot]
 	if active.Version != s.inner.Pending.ToVersion {
-		// Staged but never activated (power loss before activate): discard.
-		inactive := otherSlot(s.inner.ActiveSlot)
-		delete(s.inner.Slots, inactive)
-		if err := s.removeSlotFilesLocked(inactive); err != nil {
+		// Staged but never activated (power loss before activate): discard
+		// the staged content by version identity; the known-good slot files
+		// are the rollback target and must be preserved.
+		if err := discardVersionLocked(s, s.inner.Pending.ToVersion, s.inner.ActiveSlot); err != nil {
 			return false, err
 		}
 		s.inner.Pending = nil
@@ -268,13 +325,12 @@ func (s *Store) RecoverOnBoot(opts ...Option) (bool, error) {
 	}
 
 	// Second unconfirmed boot: automatic rollback.
-	prev := otherSlot(s.inner.ActiveSlot)
+	prev := slotWithVersion(s.inner.Slots, s.inner.Pending.FromVersion, otherSlot(s.inner.ActiveSlot))
 	if st, ok := s.inner.Slots[prev]; !ok || !st.Present || st.Version != s.inner.Pending.FromVersion {
 		return false, errors.New("device: cannot recover, previous known-good slot missing")
 	}
 	s.inner.ActiveSlot = prev
-	delete(s.inner.Slots, otherSlot(s.inner.ActiveSlot))
-	if err := s.removeSlotFilesLocked(otherSlot(s.inner.ActiveSlot)); err != nil {
+	if err := discardVersionLocked(s, s.inner.Pending.ToVersion, s.inner.ActiveSlot); err != nil {
 		return false, err
 	}
 	s.inner.Pending = nil

@@ -48,13 +48,20 @@ func setup(t *testing.T) *env {
 	v := verify.New(root, func() time.Time { return now })
 	eng := New(st, v, func() time.Time { return now })
 	e := &env{t: t, dir: dir, store: st, root: root, signers: signers, eng: eng}
-	if err := st.FactoryInit(device.SlotState{
-		Model: "dev1", Target: "app", Version: 1,
-		PayloadHash: firmware.HashPayload([]byte("v1")), InstalledAt: now.Add(-day),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	e.factoryInit([]byte("v1"))
 	return e
+}
+
+// factoryInit writes the factory firmware v1 (metadata plus payload) so the
+// active slot passes the boot-time payload integrity check.
+func (e *env) factoryInit(payload []byte) {
+	e.t.Helper()
+	if err := e.store.FactoryInit(device.SlotState{
+		Model: "dev1", Target: "app", Version: 1,
+		PayloadHash: firmware.HashPayload(payload), InstalledAt: now.Add(-day),
+	}, payload); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 func (e *env) close() { e.t.Helper(); _ = e.store.Close() }
@@ -75,8 +82,31 @@ func (e *env) reopen() *Engine {
 
 func (e *env) pkg(version uint64, mutate func(*firmware.Package)) *firmware.Package {
 	e.t.Helper()
-	k := e.signers["k"]
-	p, err := firmware.NewBuilder().Build("dev1", "app", version, []byte("body-v"+itoa(version)), "k", now.Add(-time.Hour), k.Sign)
+	return e.pkgKey("k", version, mutate)
+}
+
+// addKey registers a deterministic test signing key with an explicit validity
+// window and stores its signer, used to build rotation-window scenarios.
+func (e *env) addKey(id string, nb, na time.Time) {
+	e.t.Helper()
+	k, err := trust.GenerateTestKey(id, "seed-"+id, string(firmware.PurposeFirmware), nb, na)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if err := e.root.AddKey(trust.PublicKey{ID: id, PublicKey: k.Public, Purpose: firmware.PurposeFirmware, NotBefore: nb, NotAfter: na}); err != nil {
+		e.t.Fatal(err)
+	}
+	e.signers[id] = k
+}
+
+// pkgKey builds a firmware package signed by the given registered key.
+func (e *env) pkgKey(key string, version uint64, mutate func(*firmware.Package)) *firmware.Package {
+	e.t.Helper()
+	k, ok := e.signers[key]
+	if !ok {
+		e.t.Fatalf("no signer %q", key)
+	}
+	p, err := firmware.NewBuilder().Build("dev1", "app", version, []byte("body-v"+itoa(version)), key, now.Add(-time.Hour), k.Sign)
 	if err != nil {
 		e.t.Fatal(err)
 	}

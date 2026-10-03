@@ -25,6 +25,7 @@ const (
 	target = "app"
 	keyV1  = "k1"
 	keyV2  = "k2"
+	keyV3  = "k3"
 	day    = 24 * time.Hour
 )
 
@@ -82,9 +83,14 @@ func printJSON(v any) {
 	fmt.Println(string(b))
 }
 
-// demoRoot builds the trust root: k1 valid last year..yesterday (expired),
-// k2 valid since 100 days ago for 200 days (current). This demonstrates
-// rotation with one expired and one active key.
+// demoRoot builds the trust root demonstrating key rotation during a chained
+// upgrade lifecycle:
+//   - k1 expired before the demo time (old factory-era key),
+//   - k2 currently valid but expiring in 12 hours (about to rotate out),
+//   - k3 already valid (started 12 hours ago), so k2/k3 overlap right now —
+//     the rotation window in which two firmware keys coexist.
+//
+// Every package names exactly one KeyID, so each verdict consults only that key.
 func demoRoot() (*trust.RootOfTrust, map[string]trust.TestKey, error) {
 	root := trust.NewRoot()
 	keys := map[string]trust.TestKey{}
@@ -95,11 +101,16 @@ func demoRoot() (*trust.RootOfTrust, map[string]trust.TestKey, error) {
 		return nil, nil, err
 	}
 	k2, err := trust.GenerateTestKey(keyV2, "seed-k2", string(firmware.PurposeFirmware),
-		fixedNow.Add(-100*day), fixedNow.Add(100*day))
+		fixedNow.Add(-100*day), fixedNow.Add(12*time.Hour))
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, k := range []trust.TestKey{k1, k2} {
+	k3, err := trust.GenerateTestKey(keyV3, "seed-k3", string(firmware.PurposeFirmware),
+		fixedNow.Add(-12*time.Hour), fixedNow.Add(100*day))
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, k := range []trust.TestKey{k1, k2, k3} {
 		keys[k.ID] = k
 		if err := root.AddKey(trust.PublicKey{
 			ID: k.ID, PublicKey: k.Public,
@@ -134,13 +145,14 @@ func cmdInit(rootDir string) error {
 		return err
 	}
 	defer st.Close()
+	factoryPayload := []byte("factory-v1")
 	err = st.FactoryInit(device.SlotState{
 		Model:       model,
 		Target:      target,
 		Version:     1,
-		PayloadHash: firmware.HashPayload([]byte("factory-v1")),
+		PayloadHash: firmware.HashPayload(factoryPayload),
 		InstalledAt: fixedNow.Add(-30 * day),
-	})
+	}, factoryPayload)
 	if err != nil {
 		return err
 	}

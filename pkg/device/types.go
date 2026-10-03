@@ -30,8 +30,9 @@ type PendingActivation struct {
 // State is the full durable device state.
 type State struct {
 	Model     string
-	Committed SlotState
-	Staged    SlotState
+	Committed SlotState          // the version behind the active boot pointer
+	Staged    SlotState          // inactive slot while an update is pending
+	Retained  SlotState          // inactive slot when confirmed: previous known-good kept for rollback
 	Pending   *PendingActivation // nil when not mid-update
 	BootCount int                // boots of the active (unconfirmed) image
 }
@@ -44,4 +45,5 @@ type Store struct {
 	dir   string
 	mu    *sync.Mutex
 	inner internalState
+	lock  fileLock
 }

@@ -4,6 +4,7 @@
 package update
 
 import (
+	"sync"
 	"time"
 
 	"github.com/h3yow/secure-firmware-update-go/pkg/device"
@@ -32,6 +33,14 @@ const (
 	PolicyTargetMismatch    PolicyCode = "target_mismatch"
 	PolicyDowngrade         PolicyCode = "downgrade"
 	PolicySameVersionReplay PolicyCode = "same_version_replay"
+	// PolicyUpdateBusy is returned to the loser of two concurrent update
+	// requests against the same engine/device. Exactly one request runs;
+	// the other always gets this stable, retryable rejection.
+	PolicyUpdateBusy PolicyCode = "update_busy"
+	// PolicyTrialUnconfirmed rejects a new install while an unconfirmed trial
+	// image is still running. The operator must confirm or roll back first,
+	// otherwise the A/B rollback chain would be ambiguous.
+	PolicyTrialUnconfirmed PolicyCode = "trial_unconfirmed"
 )
 
 // Reason is the unified explanation carried by every outcome.
@@ -55,4 +64,11 @@ type Engine struct {
 	store    *device.Store
 	verifier *verify.Verifier
 	now      func() time.Time
+
+	// gate serializes mutating operations within one engine (library API
+	// used by multiple goroutines). Try-lock semantics make the losing
+	// concurrent request receive a deterministic update_busy rejection
+	// instead of queuing or corrupting state.
+	gateMu sync.Mutex
+	busy   bool
 }
