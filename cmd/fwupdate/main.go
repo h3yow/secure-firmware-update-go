@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -77,9 +78,12 @@ usage:
 	os.Exit(2)
 }
 
+// out is where command results are printed; tests swap it for a buffer.
+var out io.Writer = os.Stdout
+
 func printJSON(v any) {
 	b, _ := json.MarshalIndent(v, "", "  ")
-	fmt.Println(string(b))
+	fmt.Fprintln(out, string(b))
 }
 
 // demoRoot builds the trust root: k1 valid last year..yesterday (expired),

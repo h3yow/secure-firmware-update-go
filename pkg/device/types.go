@@ -39,6 +39,14 @@ type State struct {
 // ErrNotPending is returned when activation is requested without staging.
 var ErrNotPending = errors.New("no staged update pending activation")
 
+// ErrSlotConflict is returned when a different update is staged while one is
+// already pending: only one update may be in flight at a time.
+var ErrSlotConflict = errors.New("a different update is already staged")
+
+// ErrNothingToRevert is returned when a revert to the previous known-good
+// version is requested but no previous version is retained on device.
+var ErrNothingToRevert = errors.New("no previous known-good version retained")
+
 // Store is the file-backed device state store.
 type Store struct {
 	dir   string

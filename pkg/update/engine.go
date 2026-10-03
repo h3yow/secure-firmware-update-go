@@ -1,6 +1,8 @@
 package update
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"time"
 
@@ -22,11 +24,14 @@ func New(st *device.Store, v *verify.Verifier, now func() time.Time) *Engine {
 // stays on its known-good version. Repeating a completed install yields
 // OutcomeIdempotentNoop instead of mutating state.
 func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) Outcome {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	st, err := e.store.State()
 	if err != nil {
 		return failedSafe(0, 0, "cannot read device state: "+err.Error())
 	}
-	from := st.Committed.Version
+	from, _ := pendingRange(st)
 
 	// Stage 1: cryptographic verification.
 	vr := e.verifier.VerifyPackage(pkg)
@@ -40,8 +45,30 @@ func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) Outcome {
 		}
 	}
 
-	// Stage 2: device binding and anti-rollback policy.
-	if pc, detail := checkPolicy(st, pkg); pc != PolicyNone {
+	// Stage 2: in-flight update arbitration. While another update is pending
+	// (staged or in trial), only the exact same package may proceed — that is
+	// an idempotent retry of the interrupted install, which already passed
+	// policy once, so the policy stage is skipped for it. Any different
+	// package loses with one stable rejection, no matter its version: two
+	// concurrent requests can never both take effect.
+	retry := false
+	if st.Pending != nil {
+		same := st.Pending.ToVersion == pkg.Meta.Version && bytes.Equal(st.Pending.StagedHash, pkg.Meta.PayloadHash)
+		if !same {
+			return Outcome{
+				Code: OutcomeRejected,
+				Reason: Reason{Policy: PolicyUpdateInProgress, Detail: fmt.Sprintf(
+					"update to version %d already in progress; retry after it is confirmed or rolled back", st.Pending.ToVersion)},
+				FromVersion:  from,
+				ToVersion:    pkg.Meta.Version,
+				CurrentAfter: from,
+			}
+		}
+		retry = true
+	}
+
+	// Stage 3: device binding and anti-rollback policy.
+	if pc, detail := checkPolicy(st, pkg); !retry && pc != PolicyNone {
 		return Outcome{
 			Code:         OutcomeRejected,
 			Reason:       Reason{Policy: pc, Detail: detail},
@@ -60,6 +87,18 @@ func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) Outcome {
 		InstalledAt: e.now().UTC(),
 	}
 	if err := e.store.Stage(slot, pkg.Payload, opts...); err != nil {
+		if errors.Is(err, device.ErrSlotConflict) {
+			// A different update is already in flight (e.g. two concurrent
+			// installs): this one loses with a stable, explainable rejection
+			// and the device state is untouched.
+			return Outcome{
+				Code:         OutcomeRejected,
+				Reason:       Reason{Policy: PolicyUpdateInProgress, Detail: err.Error()},
+				FromVersion:  from,
+				ToVersion:    pkg.Meta.Version,
+				CurrentAfter: from,
+			}
+		}
 		return failedSafe(from, pkg.Meta.Version, "staging failed: "+err.Error())
 	}
 
@@ -105,6 +144,9 @@ func checkPolicy(st device.State, pkg *firmware.Package) (PolicyCode, string) {
 // ConfirmBoot confirms the running trial image as good. Calling it when no
 // trial exists is a stable no-op.
 func (e *Engine) ConfirmBoot() Outcome {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	st, err := e.store.State()
 	if err != nil {
 		return failedSafe(0, 0, "cannot read device state: "+err.Error())
@@ -131,22 +173,45 @@ func (e *Engine) ConfirmBoot() Outcome {
 	}
 }
 
-// Rollback explicitly returns to the previous known-good version. Rolling
-// back when nothing is pending is a stable no-op. The resulting state is
+// Rollback explicitly returns to a known-good version. Two cases:
+//
+//   - an update is pending (trial staged or activated): the trial is
+//     discarded and the device returns to Pending.FromVersion;
+//   - no update pending but a previous known-good version is retained: the
+//     device reverts to it (post-confirm rollback of a continuous chain).
+//
+// Rolling back when neither applies is a stable no-op. The trial path is
 // identical to the automatic boot-recovery path.
 func (e *Engine) Rollback(opts ...device.Option) Outcome {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	st, err := e.store.State()
 	if err != nil {
 		return failedSafe(0, 0, "cannot read device state: "+err.Error())
 	}
 	from, cur := pendingRange(st)
 	if st.Pending == nil {
+		if !st.Staged.Present {
+			return Outcome{
+				Code:         OutcomeIdempotentNoop,
+				Reason:       Reason{Detail: "no update to roll back"},
+				FromVersion:  st.Committed.Version,
+				ToVersion:    st.Committed.Version,
+				CurrentAfter: st.Committed.Version,
+			}
+		}
+		// Post-confirm revert to the retained previous known-good version.
+		prev := st.Staged.Version
+		if err := e.store.Revert(opts...); err != nil {
+			return failedSafe(st.Committed.Version, prev, "revert failed: "+err.Error())
+		}
 		return Outcome{
-			Code:         OutcomeIdempotentNoop,
-			Reason:       Reason{Detail: "no update to roll back"},
+			Code:         OutcomeRolledBack,
+			Reason:       Reason{Detail: fmt.Sprintf("reverted from confirmed version %d to retained known-good %d", st.Committed.Version, prev)},
 			FromVersion:  st.Committed.Version,
-			ToVersion:    st.Committed.Version,
-			CurrentAfter: st.Committed.Version,
+			ToVersion:    prev,
+			CurrentAfter: prev,
 		}
 	}
 	if err := e.store.Rollback(opts...); err != nil {
@@ -164,6 +229,9 @@ func (e *Engine) Rollback(opts ...device.Option) Outcome {
 
 // Boot applies crash/watchdog recovery and reports the resulting state.
 func (e *Engine) Boot(opts ...device.Option) (Outcome, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	before, _ := e.store.State()
 	from, trial := pendingRange(before)
 	rolledBack, err := e.store.RecoverOnBoot(opts...)

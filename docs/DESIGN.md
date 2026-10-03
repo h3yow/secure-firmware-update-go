@@ -69,6 +69,8 @@ key_purpose_mismatch / bad_signature / payload_hash_mismatch`，每个 `Result` 
 - `pkg.Version < installed.Version` → `downgrade`
 - `pkg.Version == installed.Version` → `same_version_replay`
 - 只有 `pkg.Version > installed.Version` 才允许进入安装
+- 另有 `update_in_progress`：已有**另一个**更新在途（已暂存未确认）时的稳定拒绝，
+  见第 6 节并发约定
 
 被拒绝时设备当前版本不变，返回结构化 `Outcome{code, reason, from, to, current_after}`。
 
@@ -108,9 +110,60 @@ key_purpose_mismatch / bad_signature / payload_hash_mismatch`，每个 `Result` 
 - 所有入口（库 API `Engine` 与 CLI）共用同一套引擎方法，结论结构完全一致。
 
 故障注入通过 `device.WithFaultHook(func(step string) error)` 实现，测试覆盖
-`stage.meta / stage.blob / stage.state / activate.state` 等中断点。
+`stage.meta / stage.blob / stage.state / activate.state / revert.state` 等中断点。
 
-## 6. 本地验证方法
+## 6. 连续升级、版本保留与并发约定
+
+### 连续升级语义
+
+设备从出厂版本开始可以一轮一轮连续向上安装（v1 → v2 → v3 → …）：每个新版本
+**确认健康（confirm）之后，可以立刻接着暂存并激活下一个更高版本**，中间不需要
+回滚、清空或重新初始化。每一轮仍走完整管线（验签 → 在途仲裁 → 版本策略 → 暂存
+→ 激活 → 确认），每一步都返回结构化 `Outcome`，结论可解释、可复现。
+
+连续升级跨越**密钥轮换窗口**时结论仍然唯一确定：判定只看包内 `KeyID` 对应的那
+一把钥及其有效期窗口。旧钥过期后签出的包得到 `key_expired`，新钥生效前签出的包
+得到 `key_not_yet_valid`，窗口内两把钥各自独立判定——换钥既不会卡住升级链，也
+不会悄悄放行。
+
+### 版本保留（容量下限）与崩溃安全的清理
+
+设备上**恰好保留两个版本**：当前确认运行的版本 + 上一个可以回滚的已知良好版本
+（A/B 两个物理槽各居其一）。由此：
+
+- 无在途更新时调用 `rollback`，表示**回退到保留的上一个已知良好版本**（revert）；
+  被换下的槽位立即丢弃，设备仍只持有两个版本。
+- 历史清理**融合在下一次暂存中**：无在途更新时 `Stage` 直接覆盖存放最旧版本的
+  槽位。任何时刻设备目录里只有 `state.json` + 两个槽位的 `slot-*.json/.bin`，
+  反复升级、回滚多少轮都不会越积越多（有单测断言文件集合有界）。
+- **清理中途断电/写失败是安全的**：覆盖旧槽位时每个文件原子替换、`state.json`
+  最后落盘；若崩溃发生在两者之间，`state.json` 记录的槽位元数据与磁盘上的
+  `slot-*.json` 不一致。重启时 `RecoverOnBoot` 的一致性清扫会发现不一致并剪掉
+  该槽位，设备停留在已确认的已知良好版本上，随后可以照常继续升级——不会出现
+  “既升不上去也回不去”的状态。
+
+### 并发与重复提交
+
+- 引擎用一把互斥锁串行化所有入口（Install / ConfirmBoot / Rollback / Boot），
+  任何时刻**只有一个更新在途**。
+- 两个不同的更新几乎同时到达：先进入暂存/激活的生效，另一个得到稳定结论
+  `rejected / update_in_progress`——与该包的版本高低无关，不会因为“另一个版本
+  更高”而放行，也不会出现两个都装上或状态写坏。
+- **同一份更新重复提交是幂等的**（包括并发重复）：与在途更新同版本同哈希的包
+  会被识别为同一更新，已完成的暂存/激活步骤自动跳过，结论与单次提交一致；
+  已确认之后再提交同版本则得到 `same_version_replay`。
+- CLI 与库 API 共用同一个引擎与同一套结论结构，`cmd/fwupdate` 的每条命令只是
+  引擎方法的薄封装；有测试把同一串连续升级/回滚操作分别走两条入口并逐步断言
+  `Outcome` 完全一致（含被拒绝时的原因码）。
+
+### 兼容范围
+
+- `state.json` 的 schema 仍为 1，旧版本引擎写下的状态文件可直接打开继续使用。
+- 相对上一轮的行为变化只有两处**放宽**：无在途更新时 `Stage` 允许覆盖保留槽
+  （原为拒绝）；无在途更新且有保留版本时 `rollback` 执行 revert（原为 no-op）。
+  所有既有的拒绝结论（验签类、策略类）与崩溃恢复行为保持不变。
+
+## 7. 本地验证方法
 
 要求 Go 1.25+（仓库在 Go 1.26 上开发验证），仅用标准库。
 
@@ -153,6 +206,19 @@ go run ./cmd/fwupdate install v2.sfw
 go run ./cmd/fwupdate boot                       # 第 1 次试运行启动
 go run ./cmd/fwupdate confirm                    # => confirmed, 成为已知良好 v2
 go run ./cmd/fwupdate status
+
+# 连续升级：确认后直接接着装 v3、v4，不需要回滚/清空/重新初始化
+go run ./cmd/fwupdate build v3.sfw 3
+go run ./cmd/fwupdate build v4.sfw 4
+go run ./cmd/fwupdate install v3.sfw             # => installed (trial), 2->3
+go run ./cmd/fwupdate confirm
+go run ./cmd/fwupdate install v4.sfw             # => installed (trial), 3->4
+go run ./cmd/fwupdate confirm
+go run ./cmd/fwupdate status                     # 当前 v4，仅保留 v3 作为可回滚版本
+
+# 无在途更新时的 rollback = 回退到保留的上一个已知良好版本
+go run ./cmd/fwupdate rollback                   # => rolled_back, current=3
+go run ./cmd/fwupdate install v4.sfw             # 链可以继续向前
 ```
 
 每个结论都以 JSON 打印 `code / reason / from_version / to_version / current_after`，

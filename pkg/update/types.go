@@ -4,6 +4,7 @@
 package update
 
 import (
+	"sync"
 	"time"
 
 	"github.com/h3yow/secure-firmware-update-go/pkg/device"
@@ -32,6 +33,7 @@ const (
 	PolicyTargetMismatch    PolicyCode = "target_mismatch"
 	PolicyDowngrade         PolicyCode = "downgrade"
 	PolicySameVersionReplay PolicyCode = "same_version_replay"
+	PolicyUpdateInProgress  PolicyCode = "update_in_progress" // a different update is already in flight
 )
 
 // Reason is the unified explanation carried by every outcome.
@@ -50,8 +52,11 @@ type Outcome struct {
 	CurrentAfter uint64      `json:"current_after"`
 }
 
-// Engine wires verification to the device store.
+// Engine wires verification to the device store. A single mutex serializes
+// all entry points so two concurrent requests can never both mutate state:
+// exactly one takes effect, the other gets a stable rejection.
 type Engine struct {
+	mu       sync.Mutex
 	store    *device.Store
 	verifier *verify.Verifier
 	now      func() time.Time
