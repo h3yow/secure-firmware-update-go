@@ -349,7 +349,7 @@ func TestContinuousChainKeepsDeviceDirBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 5 { // state.json + 2 slots x (json+bin)
+	if len(entries) != 6 { // state.json + lock + 2 slots x (json+bin)
 		names := []string{}
 		for _, en := range entries {
 			names = append(names, en.Name())
@@ -357,4 +357,67 @@ func TestContinuousChainKeepsDeviceDirBounded(t *testing.T) {
 		t.Fatalf("device dir must stay bounded after many rounds, got %v", names)
 	}
 	t.Logf("scenario=bounded-dir rounds=9 files=%d committed=%d", len(entries), e.committed())
+}
+
+// TestInterruptedCleanupReconciledOnRead covers the ops-crew scenario: a power
+// loss interrupts the bounded-history cleanup (overwrite of the retained old
+// slot) and the device is queried/rolled back WITHOUT going through boot
+// recovery first. Every read must be reconciled against the actual disk
+// content: the reported committed version must match the payload on disk, the
+// half-overwritten old slot must never be offered as a rollback target, and
+// the chain must be able to continue afterwards.
+func TestInterruptedCleanupReconciledOnRead(t *testing.T) {
+	e := newChainEnv(t, now)
+	defer e.store.Close()
+	e.addKey("k", now.Add(-day), now.Add(30*day))
+	e.factory(1)
+	e.installConfirm("k", 2) // committed v2, retained v1
+
+	// Power loss while staging v3 overwrites the retained v1 slot: the slot
+	// metadata file was replaced, state.json was not.
+	o := e.eng.Install(e.pkg("k", 3), device.WithFaultHook(func(step string) error {
+		if step == "stage.blob" {
+			return errors.New("power loss")
+		}
+		return nil
+	}))
+	assertCode(t, "crash-mid-cleanup", o, OutcomeFailedSafe, "crash at stage.blob while overwriting v1")
+
+	// Simulate a reboot that does NOT run boot recovery: plain reopen.
+	e.reopen()
+
+	// Status must agree with disk: committed v2, and the half-overwritten
+	// slot must already be pruned (not reported as a rollbackable version).
+	st, err := e.store.State()
+	if err != nil {
+		t.Fatalf("state must be readable after interrupted cleanup: %v", err)
+	}
+	if st.Committed.Version != 2 {
+		t.Fatalf("committed=%d want 2 (known-good)", st.Committed.Version)
+	}
+	if st.Staged.Present {
+		t.Fatalf("inconsistent retained slot must be pruned on read, got %+v", st.Staged)
+	}
+	payload, err := e.store.ReadPayload()
+	if err != nil {
+		t.Fatalf("active payload must be readable: %v", err)
+	}
+	if string(payload) != "body-v2" {
+		t.Fatalf("reported version v2 but disk payload is %q: state/disk mismatch", payload)
+	}
+	t.Logf("scenario=reconcile-on-read committed=%d disk_payload=%q staged_pruned=%v",
+		st.Committed.Version, payload, !st.Staged.Present)
+
+	// Rollback must NOT revert to the phantom v1 (its slot content is gone):
+	// with nothing retained it is a stable no-op and the device stays on v2.
+	r := e.eng.Rollback()
+	assertCode(t, "rollback-after-cleanup-crash", r, OutcomeIdempotentNoop, "rollback with pruned history")
+	if got := e.committed(); got != 2 {
+		t.Fatalf("rollback must keep known-good v2, got %d", got)
+	}
+
+	// The interrupted upgrade and the chain beyond it proceed normally.
+	e.installConfirm("k", 3)
+	e.installConfirm("k", 4)
+	t.Logf("scenario=chain-continues committed=%d", e.committed())
 }

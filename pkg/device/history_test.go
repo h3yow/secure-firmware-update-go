@@ -149,7 +149,7 @@ func TestHistoryStaysBoundedOverManyRounds(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	sort.Strings(names)
-	want := []string{"slot-A.bin", "slot-A.json", "slot-B.bin", "slot-B.json", "state.json"}
+	want := []string{"lock", "slot-A.bin", "slot-A.json", "slot-B.bin", "slot-B.json", "state.json"}
 	if len(names) != len(want) {
 		t.Fatalf("on-disk files must stay bounded: got %v want %v", names, want)
 	}
@@ -159,4 +159,57 @@ func TestHistoryStaysBoundedOverManyRounds(t *testing.T) {
 		}
 	}
 	t.Logf("scenario=bounded-history rounds=11 files=%v", names)
+}
+
+// TestReadReconcilesStateWithDisk simulates the interrupted-cleanup window
+// directly: state.json still records the retained v1 slot, but the slot's
+// on-disk metadata was already overwritten by the next stage. Any read must
+// reconcile the two instead of reporting (or rolling back to) a version whose
+// payload is no longer on disk.
+func TestReadReconcilesStateWithDisk(t *testing.T) {
+	s, dir := openStore(t)
+	_ = s.FactoryInit(slot(1))
+	round(t, s, 2) // committed v2, retained v1 in the inactive slot
+	s.Close()
+
+	// Crash window: the inactive slot's meta file was replaced by a v3 stage,
+	// state.json was never updated. After round(2) the active slot is B, so
+	// the retained v1 lives in slot A.
+	bad := slot(3)
+	bad.Present = true
+	writeSlotMeta(t, dir, "A", bad)
+
+	s2, err := Open(dir, "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	st, err := s2.State()
+	if err != nil {
+		t.Fatalf("state must be readable: %v", err)
+	}
+	if st.Committed.Version != 2 {
+		t.Fatalf("committed=%d want 2", st.Committed.Version)
+	}
+	if st.Staged.Present {
+		t.Fatalf("stale retained slot must be pruned on read, got %+v", st.Staged)
+	}
+	// Persisted: a second open sees the same reconciled state.
+	s2.Close()
+	s3, err := Open(dir, "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	st3, _ := s3.State()
+	if st3.Committed.Version != 2 || st3.Staged.Present {
+		t.Fatalf("reconciled state must persist, got %+v", st3)
+	}
+	// And the next upgrade reuses the slot normally.
+	round(t, s3, 3)
+	st4, _ := s3.State()
+	if st4.Committed.Version != 3 || !st4.Staged.Present || st4.Staged.Version != 2 {
+		t.Fatalf("chain must continue after reconcile, got %+v", st4)
+	}
+	t.Logf("scenario=read-reconcile committed=%d retained=%d", st4.Committed.Version, st4.Staged.Version)
 }

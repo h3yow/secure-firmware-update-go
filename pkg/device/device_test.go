@@ -1,7 +1,9 @@
 package device
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -146,5 +148,18 @@ func TestModelGuardOnReopen(t *testing.T) {
 	s.Close()
 	if _, err := Open(dir, "d2"); err == nil {
 		t.Fatal("opening store with foreign model must fail")
+	}
+}
+
+// writeSlotMeta overwrites a slot's on-disk metadata file directly, simulating
+// a stage that was interrupted before state.json caught up.
+func writeSlotMeta(t *testing.T, dir, slotName string, meta SlotState) {
+	t.Helper()
+	b, err := json.MarshalIndent(&meta, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "slot-"+slotName+".json"), b, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

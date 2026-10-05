@@ -162,6 +162,20 @@ func (e *Engine) ConfirmBoot() Outcome {
 		}
 	}
 	if err := e.store.Confirm(); err != nil {
+		if errors.Is(err, device.ErrNotPending) {
+			// Another process confirmed (or rolled back) the trial between our
+			// state read and the confirm: the end state is the same, so this
+			// is an idempotent no-op, not a failure.
+			if st2, err2 := e.store.State(); err2 == nil && st2.Pending == nil {
+				return Outcome{
+					Code:         OutcomeIdempotentNoop,
+					Reason:       Reason{Detail: "trial already confirmed by a concurrent request"},
+					FromVersion:  from,
+					ToVersion:    cur,
+					CurrentAfter: st2.Committed.Version,
+				}
+			}
+		}
 		return failedSafe(from, cur, "confirm failed: "+err.Error())
 	}
 	return Outcome{
@@ -204,6 +218,19 @@ func (e *Engine) Rollback(opts ...device.Option) Outcome {
 		// Post-confirm revert to the retained previous known-good version.
 		prev := st.Staged.Version
 		if err := e.store.Revert(opts...); err != nil {
+			if errors.Is(err, device.ErrNothingToRevert) {
+				// A concurrent request already reverted (or pruned) the
+				// retained slot: same end state, idempotent no-op.
+				if st2, err2 := e.store.State(); err2 == nil && !st2.Staged.Present {
+					return Outcome{
+						Code:         OutcomeIdempotentNoop,
+						Reason:       Reason{Detail: "retained previous version already reverted by a concurrent request"},
+						FromVersion:  from,
+						ToVersion:    prev,
+						CurrentAfter: st2.Committed.Version,
+					}
+				}
+			}
 			return failedSafe(st.Committed.Version, prev, "revert failed: "+err.Error())
 		}
 		return Outcome{
@@ -215,6 +242,19 @@ func (e *Engine) Rollback(opts ...device.Option) Outcome {
 		}
 	}
 	if err := e.store.Rollback(opts...); err != nil {
+		if errors.Is(err, device.ErrNotPending) {
+			// A concurrent request already rolled the trial back: same end
+			// state, idempotent no-op.
+			if st2, err2 := e.store.State(); err2 == nil && st2.Pending == nil {
+				return Outcome{
+					Code:         OutcomeIdempotentNoop,
+					Reason:       Reason{Detail: "trial already rolled back by a concurrent request"},
+					FromVersion:  from,
+					ToVersion:    cur,
+					CurrentAfter: st2.Committed.Version,
+				}
+			}
+		}
 		return failedSafe(from, cur, "rollback failed: "+err.Error())
 	}
 	after, _ := e.store.State()

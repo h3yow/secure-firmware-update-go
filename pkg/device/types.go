@@ -5,6 +5,7 @@ package device
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"time"
 )
@@ -48,8 +49,16 @@ var ErrSlotConflict = errors.New("a different update is already staged")
 var ErrNothingToRevert = errors.New("no previous known-good version retained")
 
 // Store is the file-backed device state store.
+//
+// Concurrency contract: s.mu serializes goroutines inside this process, and
+// an exclusive flock on <dir>/lock serializes whole operations across
+// processes. Every operation re-reads state.json after taking the flock and
+// reconciles it with the slot files on disk before use, so a Store never acts
+// on a stale cached view of another process's commits.
 type Store struct {
-	dir   string
-	mu    *sync.Mutex
-	inner internalState
+	dir      string
+	model    string
+	mu       *sync.Mutex
+	lockFile *os.File
+	inner    internalState
 }

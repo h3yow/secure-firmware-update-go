@@ -80,8 +80,12 @@ key_purpose_mismatch / bad_signature / payload_hash_mismatch`，每个 `Result` 
 
 - 每个槽位有独立的 `slot-A.json/slot-A.bin`、`slot-B.*`；
 - 全局 `state.json`（JSON，含 `active_slot / 两个槽元数据 / pending / boot_count`）
-  一律走 `临时文件 → rename` 原子替换，任何时刻只有“旧完整态”或“新完整态”；
-- 打开存储时清理上次中断遗留的 `*.tmp`，状态以最后一次成功落盘为准。
+  一律走 `临时文件 → fsync → rename` 原子替换，任何时刻只有“旧完整态”或“新完整态”；
+  临时文件名带进程号与序号（`*.tmp`），两个进程绝不会写同一个临时文件；
+- 设备目录里还有一个 `lock` 文件：每个操作（读状态也包括）先对它加排他
+  `flock`，**加锁后重新从磁盘读取 `state.json` 并与槽位文件对账**，然后才执行；
+  因此跨进程也不会出现“各读各的旧缓存、互相覆盖提交”的丢失更新；
+- 打开存储时在锁内清理上次中断遗留的 `*.tmp`，状态以最后一次成功落盘为准。
 
 安装生命周期：
 
@@ -105,7 +109,7 @@ key_purpose_mismatch / bad_signature / payload_hash_mismatch`，每个 `Result` 
 
 - 对同一 `(version, hash)` 重复 Stage：成功且不改动状态；
 - 已确认后重复安装同版本：稳定拒绝 `same_version_replay`（确定性的可解释结论）；
-- 中断后重试同一更新：干净完成安装（见 `TestRetriedInstallAfterCrash`）；
+- 中断后重试同一更新：干净完成安装（见 `TestRetriedInstallAfterCrashIsStable`）；
 - 重复 Confirm / 重复 Rollback / 已知良好态重复 Boot：均返回 `idempotent_noop`；
 - 所有入口（库 API `Engine` 与 CLI）共用同一套引擎方法，结论结构完全一致。
 
@@ -138,20 +142,35 @@ key_purpose_mismatch / bad_signature / payload_hash_mismatch`，每个 `Result` 
   反复升级、回滚多少轮都不会越积越多（有单测断言文件集合有界）。
 - **清理中途断电/写失败是安全的**：覆盖旧槽位时每个文件原子替换、`state.json`
   最后落盘；若崩溃发生在两者之间，`state.json` 记录的槽位元数据与磁盘上的
-  `slot-*.json` 不一致。重启时 `RecoverOnBoot` 的一致性清扫会发现不一致并剪掉
-  该槽位，设备停留在已确认的已知良好版本上，随后可以照常继续升级——不会出现
-  “既升不上去也回不去”的状态。
+  `slot-*.json` 不一致。**每次读取或使用设备状态时都会先对账**（不只是开机恢复）：
+  无在途更新时若保留槽与磁盘不一致，立即剪掉该槽并落盘，设备停留在已确认的
+  已知良好版本上——查状态、回滚、继续安装的结论始终与磁盘实际内容一致，
+  不会出现“报告回退到旧版本、磁盘上却是新载荷”的错位，也不会出现
+  “既升不上去也回不去”的状态。开机时的 `RecoverOnBoot` 清扫是同一套逻辑
+  在启动路径上的兜底。
 
 ### 并发与重复提交
 
-- 引擎用一把互斥锁串行化所有入口（Install / ConfirmBoot / Rollback / Boot），
-  任何时刻**只有一个更新在途**。
-- 两个不同的更新几乎同时到达：先进入暂存/激活的生效，另一个得到稳定结论
-  `rejected / update_in_progress`——与该包的版本高低无关，不会因为“另一个版本
-  更高”而放行，也不会出现两个都装上或状态写坏。
-- **同一份更新重复提交是幂等的**（包括并发重复）：与在途更新同版本同哈希的包
-  会被识别为同一更新，已完成的暂存/激活步骤自动跳过，结论与单次提交一致；
-  已确认之后再提交同版本则得到 `same_version_replay`。
+并发约定在**两个层面**成立：进程内，引擎用一把互斥锁串行化所有入口
+（Install / ConfirmBoot / Rollback / Boot）；跨进程，设备存储对每个操作
+（包括读状态）持有设备目录下 `lock` 文件的排他 `flock`，并在加锁后重新
+从磁盘加载状态再执行。因此同一台设备上任何时刻**只有一个更新在途**，
+与调用方是一个进程还是多个进程无关。
+
+- 两个不同的更新几乎同时到达（同一进程或两个独立进程都一样）：先完成暂存
+  的生效，另一个得到稳定结论 `rejected / update_in_progress`——与该包的版本
+  高低无关，不会因为“另一个版本更高”而放行；不会出现两个都报成功，也不会
+  出现“报成功的那个最后被悄悄覆盖”。有测试真的启动多个独立 OS 进程并发
+  安装不同版本，逐轮断言恰好一个 `installed`、其余 `update_in_progress`，
+  且设备最终版本与报成功的那个一致。
+- **同一份更新重复提交是幂等的**（包括跨进程并发重复）：与在途更新同版本同
+  哈希的包会被识别为同一更新，已完成的暂存/激活步骤自动跳过，每个进程都
+  得到与单次提交一致的 `installed`；已确认之后再提交同版本则得到
+  `same_version_replay`。并发重复提交绝不会把 `state.json` 写坏：写状态
+  全程在排他锁内、走唯一临时文件 + 原子替换，任何交错之后状态文件都可读、
+  可继续开机恢复与安装。
+- 并发的 Confirm / Rollback / Revert 同样是幂等的：一个进程先完成后，另一
+  个进程得到 `idempotent_noop` 而不是莫名其妙的失败。
 - CLI 与库 API 共用同一个引擎与同一套结论结构，`cmd/fwupdate` 的每条命令只是
   引擎方法的薄封装；有测试把同一串连续升级/回滚操作分别走两条入口并逐步断言
   `Outcome` 完全一致（含被拒绝时的原因码）。
@@ -159,6 +178,8 @@ key_purpose_mismatch / bad_signature / payload_hash_mismatch`，每个 `Result` 
 ### 兼容范围
 
 - `state.json` 的 schema 仍为 1，旧版本引擎写下的状态文件可直接打开继续使用。
+- 设备目录新增一个 `lock` 文件（跨进程互斥用，不含状态）；目录内容仍然
+  有界：`state.json + lock + 两个槽位文件`。
 - 相对上一轮的行为变化只有两处**放宽**：无在途更新时 `Stage` 允许覆盖保留槽
   （原为拒绝）；无在途更新且有保留版本时 `rollback` 执行 revert（原为 no-op）。
   所有既有的拒绝结论（验签类、策略类）与崩溃恢复行为保持不变。
@@ -178,47 +199,71 @@ go test -race ./...
 ### CLI 端到端演示（数据默认写在 $TMPDIR/sfw-demo，可用 SFW_HOME 覆盖）
 
 演示信任根内置两把固件钥：`k1`（已过期）与 `k2`（当前有效，处于轮换窗口）。
+下面每条命令的预期结论都按实际运行结果写明（`code` / 原因码 /
+`current_after`），完整输出为 JSON，含 `reason / from_version / to_version`。
 
 ```bash
 export SFW_HOME=/tmp/sfw-demo && rm -rf $SFW_HOME
 
-go run ./cmd/fwupdate init                       # 工厂版本 v1
+go run ./cmd/fwupdate init                       # 工厂版本 v1，打印完整状态
 go run ./cmd/fwupdate build v2.sfw 2             # 用当前有效钥 k2 签名 v2
-go run ./cmd/fwupdate install v2.sfw             # => installed (trial), 1->2
-go run ./cmd/fwupdate install v2.sfw             # => rejected / same_version_replay
-go run ./cmd/fwupdate build v1.sfw 1             # 签一个降级包
-go run ./cmd/fwupdate install v1.sfw             # => rejected / downgrade
+go run ./cmd/fwupdate install v2.sfw             # => installed, 1->2（试运行）
+go run ./cmd/fwupdate install v2.sfw             # => installed（同一更新在途，幂等重试，不重复安装）
+go run ./cmd/fwupdate build v1.sfw 1
+go run ./cmd/fwupdate install v1.sfw             # => rejected / update_in_progress（v2 在途，先仲裁）
 go run ./cmd/fwupdate build v3bad.sfw 3 --tamper # 翻转载荷字节
-go run ./cmd/fwupdate install v3bad.sfw          # => rejected / payload_hash_mismatch
+go run ./cmd/fwupdate install v3bad.sfw          # => rejected / payload_hash_mismatch（验签先于仲裁）
 go run ./cmd/fwupdate build v3k1.sfw 3 k1        # 用过期钥签名
 go run ./cmd/fwupdate install v3k1.sfw           # => rejected / key_expired
 
-# 试运行未确认：第 1 次 boot 仍运行新镜像，第 2 次自动回滚
-go run ./cmd/fwupdate boot
+# 试运行未确认：第 1 次 boot 计数并保持试运行（current=2），第 2 次自动回滚
+go run ./cmd/fwupdate boot                       # => idempotent_noop, current=2
 go run ./cmd/fwupdate boot                       # => rolled_back, current=1
 
 # 显式回滚路径（最终状态与自动回滚一致）
-go run ./cmd/fwupdate install v2.sfw
+go run ./cmd/fwupdate install v2.sfw             # => installed, 1->2
 go run ./cmd/fwupdate rollback                   # => rolled_back, current=1
 
 # 正常升级并确认
-go run ./cmd/fwupdate install v2.sfw
+go run ./cmd/fwupdate install v2.sfw             # => installed, 1->2
 go run ./cmd/fwupdate boot                       # 第 1 次试运行启动
 go run ./cmd/fwupdate confirm                    # => confirmed, 成为已知良好 v2
-go run ./cmd/fwupdate status
+
+# 确认后再演示版本策略：降级与同版本重放
+go run ./cmd/fwupdate install v1.sfw             # => rejected / downgrade
+go run ./cmd/fwupdate install v2.sfw             # => rejected / same_version_replay
 
 # 连续升级：确认后直接接着装 v3、v4，不需要回滚/清空/重新初始化
 go run ./cmd/fwupdate build v3.sfw 3
 go run ./cmd/fwupdate build v4.sfw 4
-go run ./cmd/fwupdate install v3.sfw             # => installed (trial), 2->3
-go run ./cmd/fwupdate confirm
-go run ./cmd/fwupdate install v4.sfw             # => installed (trial), 3->4
-go run ./cmd/fwupdate confirm
-go run ./cmd/fwupdate status                     # 当前 v4，仅保留 v3 作为可回滚版本
+go run ./cmd/fwupdate install v3.sfw             # => installed, 2->3
+go run ./cmd/fwupdate confirm                    # => confirmed, current=3
+go run ./cmd/fwupdate install v4.sfw             # => installed, 3->4
+go run ./cmd/fwupdate confirm                    # => confirmed, current=4
+go run ./cmd/fwupdate status                     # Committed.version=4，Staged.version=3（仅保留上一个）
 
 # 无在途更新时的 rollback = 回退到保留的上一个已知良好版本
 go run ./cmd/fwupdate rollback                   # => rolled_back, current=3
-go run ./cmd/fwupdate install v4.sfw             # 链可以继续向前
+go run ./cmd/fwupdate install v4.sfw             # => installed, 3->4（链可以继续向前）
+go run ./cmd/fwupdate confirm                    # => confirmed, current=4
+```
+
+跨进程并发演示（真的起两个独立进程，任一时刻只有一个更新生效）：
+
+```bash
+go run ./cmd/fwupdate build v5.sfw 5
+go run ./cmd/fwupdate build v6.sfw 6
+
+# 两个不同的更新同时到达：恰好一个 installed，另一个 update_in_progress；
+# 哪个赢取决于时序，但绝不会两个都成功
+go run ./cmd/fwupdate install v5.sfw & go run ./cmd/fwupdate install v6.sfw & wait
+go run ./cmd/fwupdate status                     # Committed 一定是报成功那个版本
+
+# 同一份更新被两个进程同时提交：两个进程都报 installed（幂等），设备只装上一次
+go run ./cmd/fwupdate confirm                    # 先确认上一轮的胜者
+go run ./cmd/fwupdate build v7.sfw 7
+go run ./cmd/fwupdate install v7.sfw & go run ./cmd/fwupdate install v7.sfw & wait
+go run ./cmd/fwupdate status                     # Committed.version=7，状态文件完好可读
 ```
 
 每个结论都以 JSON 打印 `code / reason / from_version / to_version / current_after`，

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,10 +46,27 @@ func (o options) fire(step string) error {
 	return nil
 }
 
-// writeFileAtomic writes data to name via temp+fsync+rename.
+// tmpSeq makes every temp file name unique within a process; combined with
+// the PID, two processes can never write (or clean up) each other's temp
+// file mid-operation.
+var tmpSeq atomic.Uint64
+
+// writeFileAtomic writes data to name via a unique temp file + fsync + rename.
 func (s *Store) writeFileAtomic(name string, data []byte) error {
-	tmp := name + tmpSuffix
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp := fmt.Sprintf("%s.%d.%d%s", name, os.Getpid(), tmpSeq.Add(1), tmpSuffix)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, name)
@@ -105,6 +123,10 @@ func (s *Store) Stage(meta SlotState, payload []byte, opts ...Option) error {
 	o := resolve(opts)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.beginOpLocked(); err != nil {
+		return err
+	}
+	defer s.endOpLocked()
 
 	meta.Present = true
 	if meta.InstalledAt.IsZero() {
@@ -151,6 +173,10 @@ func (s *Store) Activate(opts ...Option) error {
 	o := resolve(opts)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.beginOpLocked(); err != nil {
+		return err
+	}
+	defer s.endOpLocked()
 
 	if s.inner.Pending == nil {
 		return ErrNotPending
@@ -185,6 +211,10 @@ func (s *Store) Confirm(opts ...Option) error {
 	o := resolve(opts)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.beginOpLocked(); err != nil {
+		return err
+	}
+	defer s.endOpLocked()
 
 	if s.inner.Pending == nil {
 		return ErrNotPending
@@ -206,6 +236,10 @@ func (s *Store) Rollback(opts ...Option) error {
 	o := resolve(opts)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.beginOpLocked(); err != nil {
+		return err
+	}
+	defer s.endOpLocked()
 	if s.inner.Pending == nil {
 		return ErrNotPending
 	}
@@ -258,6 +292,10 @@ func (s *Store) Revert(opts ...Option) error {
 	o := resolve(opts)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.beginOpLocked(); err != nil {
+		return err
+	}
+	defer s.endOpLocked()
 	if s.inner.Pending != nil {
 		return errors.New("device: update pending, use Rollback instead of Revert")
 	}
@@ -330,6 +368,10 @@ func (s *Store) RecoverOnBoot(opts ...Option) (bool, error) {
 	o := resolve(opts)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.beginOpLocked(); err != nil {
+		return false, err
+	}
+	defer s.endOpLocked()
 
 	if s.inner.Pending == nil {
 		if !s.inactiveConsistentLocked() {
@@ -393,6 +435,10 @@ func (s *Store) RecoverOnBoot(opts ...Option) (bool, error) {
 func (s *Store) ReadPayload() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.beginOpLocked(); err != nil {
+		return nil, err
+	}
+	defer s.endOpLocked()
 	b, err := os.ReadFile(filepath.Join(s.dir, "slot-"+s.inner.ActiveSlot+".bin"))
 	if err != nil {
 		return nil, fmt.Errorf("device: read active payload: %w", err)
