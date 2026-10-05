@@ -51,5 +51,6 @@ var ErrNothingToRevert = errors.New("no previous known-good version retained")
 type Store struct {
 	dir   string
 	mu    *sync.Mutex
+	lock  *dirLock // cross-process exclusion for Begin()
 	inner internalState
 }

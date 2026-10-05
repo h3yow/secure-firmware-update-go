@@ -144,7 +144,7 @@ func cmdInit(rootDir string) error {
 		Version:     1,
 		PayloadHash: firmware.HashPayload([]byte("factory-v1")),
 		InstalledAt: fixedNow.Add(-30 * day),
-	})
+	}, []byte("factory-v1"))
 	if err != nil {
 		return err
 	}

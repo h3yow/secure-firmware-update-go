@@ -24,7 +24,7 @@ func openStore(t *testing.T) (*Store, string) {
 
 func TestFactoryInitAndPersistence(t *testing.T) {
 	s, dir := openStore(t)
-	if err := s.FactoryInit(slot(1)); err != nil {
+	if err := s.FactoryInit(slot(1), []byte{byte(1)}); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -41,7 +41,7 @@ func TestFactoryInitAndPersistence(t *testing.T) {
 	if st.Committed.Version != 1 {
 		t.Fatalf("version=%d want 1", st.Committed.Version)
 	}
-	if err := s2.FactoryInit(slot(9)); err == nil {
+	if err := s2.FactoryInit(slot(9), []byte{byte(9)}); err == nil {
 		t.Fatal("second factory init must be refused")
 	}
 	s2.Close()
@@ -50,7 +50,7 @@ func TestFactoryInitAndPersistence(t *testing.T) {
 func TestStageIdempotentIdenticalContent(t *testing.T) {
 	s, _ := openStore(t)
 	defer s.Close()
-	if err := s.FactoryInit(slot(1)); err != nil {
+	if err := s.FactoryInit(slot(1), []byte{byte(1)}); err != nil {
 		t.Fatal(err)
 	}
 	m := slot(2)
@@ -71,7 +71,7 @@ func TestStageIdempotentIdenticalContent(t *testing.T) {
 func TestActivationRollbackPhysicalSlots(t *testing.T) {
 	s, _ := openStore(t)
 	defer s.Close()
-	if err := s.FactoryInit(slot(1)); err != nil {
+	if err := s.FactoryInit(slot(1), []byte{byte(1)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Stage(slot(2), []byte{2}); err != nil {
@@ -100,7 +100,7 @@ func TestActivationRollbackPhysicalSlots(t *testing.T) {
 func TestStageCrashLeavesNoHalfWrittenState(t *testing.T) {
 	s, dir := openStore(t)
 	defer s.Close()
-	if err := s.FactoryInit(slot(1)); err != nil {
+	if err := s.FactoryInit(slot(1), []byte{byte(1)}); err != nil {
 		t.Fatal(err)
 	}
 	err := s.Stage(slot(2), []byte{2}, WithFaultHook(func(step string) error {
@@ -128,7 +128,7 @@ func TestStageCrashLeavesNoHalfWrittenState(t *testing.T) {
 func TestActivateWithoutPending(t *testing.T) {
 	s, _ := openStore(t)
 	defer s.Close()
-	_ = s.FactoryInit(slot(1))
+	_ = s.FactoryInit(slot(1), []byte{byte(1)})
 	if err := s.Activate(); err != ErrNotPending {
 		t.Fatalf("got %v want ErrNotPending", err)
 	}
@@ -142,7 +142,7 @@ func TestActivateWithoutPending(t *testing.T) {
 
 func TestModelGuardOnReopen(t *testing.T) {
 	s, dir := openStore(t)
-	_ = s.FactoryInit(slot(1))
+	_ = s.FactoryInit(slot(1), []byte{byte(1)})
 	s.Close()
 	if _, err := Open(dir, "d2"); err == nil {
 		t.Fatal("opening store with foreign model must fail")

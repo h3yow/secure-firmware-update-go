@@ -19,18 +19,39 @@ func New(st *device.Store, v *verify.Verifier, now func() time.Time) *Engine {
 	return &Engine{store: st, verifier: v, now: now}
 }
 
-// Install is the main entry point: verify -> target/version policy ->
-// stage -> activate. On any rejection or injected write failure the device
-// stays on its known-good version. Repeating a completed install yields
-// OutcomeIdempotentNoop instead of mutating state.
-func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) Outcome {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	st, err := e.store.State()
+// Install is the main entry point: acquire the cross-device exclusive
+// transaction, then verify -> target/version policy -> stage -> activate.
+//
+// The whole operation runs in one transaction that is also exclusive across
+// processes (flock on the device directory), so two installs arriving in
+// separate processes are fully serialized: the second one sees the first
+// one's committed pending state and either joins it (identical package,
+// idempotent) or loses with the stable update_in_progress rejection. On any
+// rejection or injected write failure the device stays on its known-good
+// version.
+func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) (o Outcome) {
+	tx, err := e.store.Begin()
 	if err != nil {
-		return failedSafe(0, 0, "cannot read device state: "+err.Error())
+		return failedSafe(0, 0, "cannot open device transaction: "+err.Error())
 	}
+	defer func() {
+		if err := recover(); err != nil {
+			_ = tx.Abort()
+			panic(err)
+		}
+	}()
+
+	// Decide whether the transaction may be released normally; any early
+	// rejection path must abort it (the device was not mutated) so the flock
+	// is dropped promptly.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Abort()
+		}
+	}()
+
+	st := tx.Snapshot()
 	from, _ := pendingRange(st)
 
 	// Stage 1: cryptographic verification.
@@ -78,7 +99,7 @@ func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) Outcome {
 		}
 	}
 
-	// Stage 3: stage into inactive slot.
+	// Stage 4: stage into the inactive slot.
 	slot := device.SlotState{
 		Model:       pkg.Meta.Model,
 		Target:      pkg.Meta.TargetSlot,
@@ -86,7 +107,7 @@ func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) Outcome {
 		PayloadHash: append([]byte(nil), pkg.Meta.PayloadHash...),
 		InstalledAt: e.now().UTC(),
 	}
-	if err := e.store.Stage(slot, pkg.Payload, opts...); err != nil {
+	if err := tx.Stage(slot, pkg.Payload, opts...); err != nil {
 		if errors.Is(err, device.ErrSlotConflict) {
 			// A different update is already in flight (e.g. two concurrent
 			// installs): this one loses with a stable, explainable rejection
@@ -102,22 +123,27 @@ func (e *Engine) Install(pkg *firmware.Package, opts ...device.Option) Outcome {
 		return failedSafe(from, pkg.Meta.Version, "staging failed: "+err.Error())
 	}
 
-	// Stage 4: activate (atomic boot-pointer flip).
-	if err := e.store.Activate(opts...); err != nil {
+	// Stage 5: activate (atomic boot-pointer flip).
+	if err := tx.Activate(opts...); err != nil {
 		// Activation failure after successful staging must not strand the
 		// device: explicit rollback discards the staged slot and keeps the
 		// known-good version active.
-		_ = e.store.Rollback()
+		_ = tx.Rollback()
 		return failedSafe(from, pkg.Meta.Version, "activation failed: "+err.Error())
 	}
 
-	return Outcome{
+	o = Outcome{
 		Code:         OutcomeInstalled,
 		Reason:       Reason{Detail: "signature valid, version strictly newer, image activated as trial"},
 		FromVersion:  from,
 		ToVersion:    pkg.Meta.Version,
 		CurrentAfter: pkg.Meta.Version,
 	}
+	if err := tx.Commit(); err != nil {
+		return failedSafe(from, pkg.Meta.Version, "commit transaction failed: "+err.Error())
+	}
+	committed = true
+	return o
 }
 
 // checkPolicy enforces: model match, target slot match, strictly increasing
@@ -144,14 +170,18 @@ func checkPolicy(st device.State, pkg *firmware.Package) (PolicyCode, string) {
 // ConfirmBoot confirms the running trial image as good. Calling it when no
 // trial exists is a stable no-op.
 func (e *Engine) ConfirmBoot() Outcome {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	st, err := e.store.State()
+	tx, err := e.store.Begin()
 	if err != nil {
-		return failedSafe(0, 0, "cannot read device state: "+err.Error())
+		return failedSafe(0, 0, "cannot open device transaction: "+err.Error())
 	}
-	from, cur := pendingRange(st)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Abort()
+		}
+	}()
+
+	st := tx.Snapshot()
 	if st.Pending == nil {
 		return Outcome{
 			Code:         OutcomeIdempotentNoop,
@@ -161,9 +191,14 @@ func (e *Engine) ConfirmBoot() Outcome {
 			CurrentAfter: st.Committed.Version,
 		}
 	}
-	if err := e.store.Confirm(); err != nil {
+	from, cur := pendingRange(st)
+	if err := tx.Confirm(); err != nil {
 		return failedSafe(from, cur, "confirm failed: "+err.Error())
 	}
+	if err := tx.Commit(); err != nil {
+		return failedSafe(from, cur, "commit transaction failed: "+err.Error())
+	}
+	committed = true
 	return Outcome{
 		Code:         OutcomeConfirmed,
 		Reason:       Reason{Detail: "active image confirmed as known-good"},
@@ -183,14 +218,18 @@ func (e *Engine) ConfirmBoot() Outcome {
 // Rolling back when neither applies is a stable no-op. The trial path is
 // identical to the automatic boot-recovery path.
 func (e *Engine) Rollback(opts ...device.Option) Outcome {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	st, err := e.store.State()
+	tx, err := e.store.Begin()
 	if err != nil {
-		return failedSafe(0, 0, "cannot read device state: "+err.Error())
+		return failedSafe(0, 0, "cannot open device transaction: "+err.Error())
 	}
-	from, cur := pendingRange(st)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Abort()
+		}
+	}()
+
+	st := tx.Snapshot()
 	if st.Pending == nil {
 		if !st.Staged.Present {
 			return Outcome{
@@ -203,46 +242,66 @@ func (e *Engine) Rollback(opts ...device.Option) Outcome {
 		}
 		// Post-confirm revert to the retained previous known-good version.
 		prev := st.Staged.Version
-		if err := e.store.Revert(opts...); err != nil {
+		if err := tx.Revert(opts...); err != nil {
 			return failedSafe(st.Committed.Version, prev, "revert failed: "+err.Error())
 		}
-		return Outcome{
+		o := Outcome{
 			Code:         OutcomeRolledBack,
 			Reason:       Reason{Detail: fmt.Sprintf("reverted from confirmed version %d to retained known-good %d", st.Committed.Version, prev)},
 			FromVersion:  st.Committed.Version,
 			ToVersion:    prev,
 			CurrentAfter: prev,
 		}
+		if err := tx.Commit(); err != nil {
+			return failedSafe(st.Committed.Version, prev, "commit transaction failed: "+err.Error())
+		}
+		committed = true
+		return o
 	}
-	if err := e.store.Rollback(opts...); err != nil {
+	from, cur := pendingRange(st)
+	if err := tx.Rollback(opts...); err != nil {
 		return failedSafe(from, cur, "rollback failed: "+err.Error())
 	}
-	after, _ := e.store.State()
-	return Outcome{
+	after := tx.Snapshot()
+	o := Outcome{
 		Code:         OutcomeRolledBack,
 		Reason:       Reason{Detail: fmt.Sprintf("returned from version %d to known-good %d", cur, from)},
 		FromVersion:  from,
 		ToVersion:    cur,
 		CurrentAfter: after.Committed.Version,
 	}
+	if err := tx.Commit(); err != nil {
+		return failedSafe(from, cur, "commit transaction failed: "+err.Error())
+	}
+	committed = true
+	return o
 }
 
 // Boot applies crash/watchdog recovery and reports the resulting state.
 func (e *Engine) Boot(opts ...device.Option) (Outcome, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	before, _ := e.store.State()
-	from, trial := pendingRange(before)
-	rolledBack, err := e.store.RecoverOnBoot(opts...)
+	tx, err := e.store.Begin()
 	if err != nil {
-		st, _ := e.store.State()
+		return failedSafe(0, 0, "cannot open device transaction: "+err.Error()), err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Abort()
+		}
+	}()
+
+	before := tx.Snapshot()
+	from, trial := pendingRange(before)
+	rolledBack, err := tx.RecoverOnBoot(opts...)
+	if err != nil {
+		st := tx.Snapshot()
 		return failedSafe(st.Committed.Version, trial, "boot recovery failed: "+err.Error()), err
 	}
-	st, err := e.store.State()
-	if err != nil {
-		return Outcome{}, err
+	st := tx.Snapshot()
+	if err := tx.Commit(); err != nil {
+		return failedSafe(st.Committed.Version, trial, "commit transaction failed: "+err.Error()), err
 	}
+	committed = true
 	if rolledBack {
 		return Outcome{
 			Code:         OutcomeRolledBack,

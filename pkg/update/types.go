@@ -4,7 +4,6 @@
 package update
 
 import (
-	"sync"
 	"time"
 
 	"github.com/h3yow/secure-firmware-update-go/pkg/device"
@@ -52,11 +51,12 @@ type Outcome struct {
 	CurrentAfter uint64      `json:"current_after"`
 }
 
-// Engine wires verification to the device store. A single mutex serializes
-// all entry points so two concurrent requests can never both mutate state:
-// exactly one takes effect, the other gets a stable rejection.
+// Engine wires verification to the device store. Serialization is provided
+// by the device store's cross-process transaction (an in-process mutex plus
+// a flock on the device directory), so two concurrent requests in the same
+// process or in different processes can never both mutate state: exactly
+// one takes effect, the other gets a stable rejection.
 type Engine struct {
-	mu       sync.Mutex
 	store    *device.Store
 	verifier *verify.Verifier
 	now      func() time.Time

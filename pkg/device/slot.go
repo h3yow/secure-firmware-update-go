@@ -45,7 +45,7 @@ func (o options) fire(step string) error {
 	return nil
 }
 
-// writeFileAtomic writes data to name via temp+fsync+rename.
+// writeFileAtomic writes data to name via temp+rename.
 func (s *Store) writeFileAtomic(name string, data []byte) error {
 	tmp := name + tmpSuffix
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
@@ -87,6 +87,11 @@ func (s *Store) writeSlotFilesLocked(slot string, meta SlotState, payload []byte
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Transactional operations. Each xxxLocked method assumes the caller holds
+// the in-process mutex and the cross-process lock (i.e. runs inside a Tx).
+// ---------------------------------------------------------------------------
+
 // Stage writes the payload into the inactive slot. The inactive slot may be
 // in one of three states:
 //
@@ -100,11 +105,10 @@ func (s *Store) writeSlotFilesLocked(slot string, meta SlotState, payload []byte
 //     keeps at most "current + previous", and reclaiming the oldest slot is
 //     fused into the next staging. The overwrite is crash-safe because each
 //     file is replaced atomically and state.json is updated last; a crash
-//     mid-overwrite is detected and pruned by RecoverOnBoot.
-func (s *Store) Stage(meta SlotState, payload []byte, opts ...Option) error {
+//     mid-overwrite is detected (against disk truth) and pruned by
+//     reconcileLocked on the next Open or transaction.
+func (s *Store) stageLocked(meta SlotState, payload []byte, opts ...Option) error {
 	o := resolve(opts)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	meta.Present = true
 	if meta.InstalledAt.IsZero() {
@@ -144,13 +148,11 @@ func (s *Store) Stage(meta SlotState, payload []byte, opts ...Option) error {
 	return nil
 }
 
-// Activate flips the boot pointer to the staged slot in a single atomic state
-// write. The new image runs as a trial: it must be confirmed at the next boot,
+// activateLocked flips the boot pointer to the staged slot in a single
+// atomic state write. The new image runs as a trial: it must be confirmed,
 // otherwise RecoverOnBoot rolls back.
-func (s *Store) Activate(opts ...Option) error {
+func (s *Store) activateLocked(opts ...Option) error {
 	o := resolve(opts)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.inner.Pending == nil {
 		return ErrNotPending
@@ -180,11 +182,9 @@ func (s *Store) Activate(opts ...Option) error {
 	return nil
 }
 
-// Confirm marks the active trial image as good and clears the rollback state.
-func (s *Store) Confirm(opts ...Option) error {
+// confirmLocked marks the active trial image as good and clears the rollback state.
+func (s *Store) confirmLocked(opts ...Option) error {
 	o := resolve(opts)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.inner.Pending == nil {
 		return ErrNotPending
@@ -200,12 +200,10 @@ func (s *Store) Confirm(opts ...Option) error {
 	return nil
 }
 
-// Rollback restores the previous known-good slot atomically and clears the
-// staged trial. It is safe to call whether or not the trial was activated.
-func (s *Store) Rollback(opts ...Option) error {
+// rollbackLocked restores the previous known-good slot atomically and clears
+// the staged trial. It is safe to call whether or not the trial was activated.
+func (s *Store) rollbackLocked(opts ...Option) error {
 	o := resolve(opts)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.inner.Pending == nil {
 		return ErrNotPending
 	}
@@ -239,6 +237,7 @@ func slotWithVersion(slots map[string]SlotState, version uint64, fallback string
 	return fallback
 }
 
+// removeSlotFilesLocked removes a slot's metadata and payload files.
 func (s *Store) removeSlotFilesLocked(slot string) error {
 	for _, suffix := range []string{".json", ".bin"} {
 		name := filepath.Join(s.dir, "slot-"+slot+suffix)
@@ -249,15 +248,13 @@ func (s *Store) removeSlotFilesLocked(slot string) error {
 	return nil
 }
 
-// Revert flips the device back to the retained previous known-good version
-// after the current one was already confirmed. The slot being left is
-// discarded, so the device still holds at most two versions afterwards.
+// revertLocked flips the device back to the retained previous known-good
+// version after the current one was already confirmed. The slot being left
+// is discarded, so the device still holds at most two versions afterwards.
 // It refuses while an update is pending (use Rollback for trials) and when
 // no previous version is retained (ErrNothingToRevert).
-func (s *Store) Revert(opts ...Option) error {
+func (s *Store) revertLocked(opts ...Option) error {
 	o := resolve(opts)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.inner.Pending != nil {
 		return errors.New("device: update pending, use Rollback instead of Revert")
 	}
@@ -279,69 +276,15 @@ func (s *Store) Revert(opts ...Option) error {
 	return s.persistLocked()
 }
 
-// readSlotMetaLocked reads the on-disk metadata of one slot.
-func (s *Store) readSlotMetaLocked(slot string) (SlotState, error) {
-	b, err := os.ReadFile(filepath.Join(s.dir, "slot-"+slot+".json"))
-	if err != nil {
-		return SlotState{}, err
-	}
-	var meta SlotState
-	if err := json.Unmarshal(b, &meta); err != nil {
-		return SlotState{}, err
-	}
-	return meta, nil
-}
-
-// pruneInactiveLocked drops the inactive slot's metadata and files. Used when
-// a crash interrupted the bounded-history cleanup (overwrite during Stage)
-// and left state.json and the slot files disagreeing.
-func (s *Store) pruneInactiveLocked() error {
-	inactive := otherSlot(s.inner.ActiveSlot)
-	delete(s.inner.Slots, inactive)
-	return s.removeSlotFilesLocked(inactive)
-}
-
-// inactiveConsistentLocked reports whether the retained previous version's
-// on-disk metadata still matches state.json. A mismatch means a crash or
-// write failure interrupted the overwrite of the old slot mid-Stage.
-func (s *Store) inactiveConsistentLocked() bool {
-	inactive := otherSlot(s.inner.ActiveSlot)
-	recorded, ok := s.inner.Slots[inactive]
-	if !ok || !recorded.Present {
-		return true // nothing retained: trivially consistent
-	}
-	onDisk, err := s.readSlotMetaLocked(inactive)
-	if err != nil {
-		return false
-	}
-	return onDisk.Version == recorded.Version && bytes.Equal(onDisk.PayloadHash, recorded.PayloadHash)
-}
-
-// RecoverOnBoot performs boot-time policy: a trial image that activated but
-// was never confirmed (power loss / crash / bad image) is rolled back so the
-// device always ends on a known-good version. Returns true when a rollback
-// occurred. Confirming after a clean trial boot clears pending.
-//
-// It also sweeps the bounded version history: if a crash interrupted the
-// cleanup (overwrite) of the oldest retained slot, the inconsistent slot is
-// pruned so the device keeps booting the committed known-good version and
-// future upgrades are never blocked by leftover history.
-func (s *Store) RecoverOnBoot(opts ...Option) (bool, error) {
+// recoverOnBootLocked performs boot-time policy: a trial image that
+// activated but was never confirmed (power loss / crash / bad image) is
+// rolled back so the device always ends on a known-good version. Returns
+// true when a rollback occurred. Disk reconciliation already ran when the
+// transaction began, so this method only applies the trial-boot policy.
+func (s *Store) recoverOnBootLocked(opts ...Option) (bool, error) {
 	o := resolve(opts)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.inner.Pending == nil {
-		if !s.inactiveConsistentLocked() {
-			if err := s.pruneInactiveLocked(); err != nil {
-				return false, err
-			}
-			s.inner.BootCount = 0
-			if err := o.fire("boot.state"); err != nil {
-				return false, err
-			}
-			return false, s.persistLocked()
-		}
 		return false, nil
 	}
 	active := s.inner.Slots[s.inner.ActiveSlot]
@@ -377,10 +320,10 @@ func (s *Store) RecoverOnBoot(opts ...Option) (bool, error) {
 		return false, errors.New("device: cannot recover, previous known-good slot missing")
 	}
 	s.inner.ActiveSlot = prev
-	delete(s.inner.Slots, otherSlot(s.inner.ActiveSlot))
 	if err := s.removeSlotFilesLocked(otherSlot(s.inner.ActiveSlot)); err != nil {
 		return false, err
 	}
+	delete(s.inner.Slots, otherSlot(s.inner.ActiveSlot))
 	s.inner.Pending = nil
 	s.inner.BootCount = 0
 	if err := o.fire("boot.state"); err != nil {
@@ -389,10 +332,8 @@ func (s *Store) RecoverOnBoot(opts ...Option) (bool, error) {
 	return true, s.persistLocked()
 }
 
-// ReadPayload returns the payload bytes of the currently active slot.
-func (s *Store) ReadPayload() ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// readPayloadLocked returns the payload bytes of the currently active slot.
+func (s *Store) readPayloadLocked() ([]byte, error) {
 	b, err := os.ReadFile(filepath.Join(s.dir, "slot-"+s.inner.ActiveSlot+".bin"))
 	if err != nil {
 		return nil, fmt.Errorf("device: read active payload: %w", err)

@@ -88,7 +88,7 @@ func (e *chainEnv) factory(version uint64) {
 	if err := e.store.FactoryInit(device.SlotState{
 		Model: "dev1", Target: "app", Version: version,
 		PayloadHash: firmware.HashPayload([]byte("factory")), InstalledAt: e.clock.Add(-day),
-	}); err != nil {
+	}, []byte("factory")); err != nil {
 		e.t.Fatal(err)
 	}
 }
@@ -349,7 +349,7 @@ func TestContinuousChainKeepsDeviceDirBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 5 { // state.json + 2 slots x (json+bin)
+	if len(entries) != 6 { // state.json + lock + 2 slots x (json+bin)
 		names := []string{}
 		for _, en := range entries {
 			names = append(names, en.Name())

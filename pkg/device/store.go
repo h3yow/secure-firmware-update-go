@@ -13,6 +13,7 @@ import (
 
 const (
 	stateFileName = "state.json"
+	lockFileName  = "store.lock"
 	tmpSuffix     = ".tmp"
 	slotA         = "A"
 	slotB         = "B"
@@ -42,17 +43,50 @@ func Open(dir, model string) (*Store, error) {
 		return nil, fmt.Errorf("device: mkdir: %w", err)
 	}
 	s := &Store{dir: dir, mu: &sync.Mutex{}, inner: internalState{}}
+	// Hold the cross-process lock for the whole open+recovery sequence so two
+	// processes initializing or recovering the same device cannot interleave.
+	lk, err := openDirLock(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := lk.acquire(); err != nil {
+		return nil, err
+	}
 	if err := removeTemps(dir); err != nil {
+		_ = lk.release()
 		return nil, err
 	}
 	if err := s.loadOrInit(model); err != nil {
+		_ = lk.release()
 		return nil, err
 	}
+	// Reconcile against disk truth before anyone can use the store: opening a
+	// device must never leave a reported version that disagrees with the slot
+	// payload actually on disk.
+	if err := s.reconcileLocked(); err != nil {
+		_ = lk.release()
+		return nil, err
+	}
+	if err := lk.release(); err != nil {
+		return nil, err
+	}
+	s.lock = lk
 	return s, nil
 }
 
-// Close releases the store.
-func (s *Store) Close() error { return nil }
+// Close releases store resources and shuts the cross-process lock file.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lock != nil {
+		lk := s.lock
+		s.lock = nil
+		if err := lk.close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func removeTemps(dir string) error {
 	entries, err := os.ReadDir(dir)
@@ -70,33 +104,51 @@ func removeTemps(dir string) error {
 }
 
 func (s *Store) loadOrInit(model string) error {
-	path := filepath.Join(s.dir, stateFileName)
-	b, err := os.ReadFile(path)
+	b, err := readStateFile(s.dir)
 	if errors.Is(err, os.ErrNotExist) {
 		s.inner = internalState{Model: model, ActiveSlot: slotA, Slots: map[string]SlotState{}}
 		return s.persistLocked()
 	}
 	if err != nil {
-		return fmt.Errorf("device: read state: %w", err)
+		return err
 	}
 	var in internalState
-	if err := json.Unmarshal(b, &in); err != nil {
-		return fmt.Errorf("device: corrupt state file: %w", err)
+	if err := unmarshalState(b, &in); err != nil {
+		return err
 	}
 	if in.Schema != 1 {
-		return fmt.Errorf("device: unsupported state schema %d", in.Schema)
+		return errUnsupportedSchema(in.Schema)
 	}
 	if in.Model != model {
 		return fmt.Errorf("device: store belongs to model %q, asked for %q", in.Model, model)
 	}
 	if in.ActiveSlot != slotA && in.ActiveSlot != slotB {
-		return fmt.Errorf("device: corrupt active slot %q", in.ActiveSlot)
+		return errBadActiveSlot(in.ActiveSlot)
 	}
 	if in.Slots == nil {
 		in.Slots = map[string]SlotState{}
 	}
 	s.inner = in
 	return nil
+}
+
+func readStateFile(dir string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(dir, stateFileName))
+}
+
+func unmarshalState(b []byte, in *internalState) error {
+	if err := json.Unmarshal(b, in); err != nil {
+		return fmt.Errorf("device: corrupt state file: %w", err)
+	}
+	return nil
+}
+
+func errUnsupportedSchema(n int) error {
+	return fmt.Errorf("device: unsupported state schema %d", n)
+}
+
+func errBadActiveSlot(name string) error {
+	return fmt.Errorf("device: corrupt active slot %q", name)
 }
 
 // persistLocked writes state atomically: temp file, fsync, rename. A crash at
@@ -119,11 +171,19 @@ func (s *Store) persistLocked() error {
 }
 
 // State returns an external snapshot view of the durable state: the active
-// slot is "Committed", the inactive slot is "Staged".
+// slot is "Committed", the inactive slot is "Staged". Opening the
+// transaction first reconciles state.json with the slot files on disk, so
+// the returned view can never disagree with what the device would boot.
 func (s *Store) State() (State, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.viewLocked(), nil
+	tx, err := s.Begin()
+	if err != nil {
+		return State{}, err
+	}
+	out := tx.Snapshot()
+	if err := tx.Commit(); err != nil {
+		return State{}, err
+	}
+	return out, nil
 }
 
 func (s *Store) viewLocked() State {
@@ -149,21 +209,32 @@ func otherSlot(x string) string {
 	return slotA
 }
 
-// FactoryInit writes the initial known-good firmware into slot A. Only
-// allowed on a store without a committed image.
-func (s *Store) FactoryInit(init SlotState) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// FactoryInit writes the initial known-good firmware (metadata + payload)
+// into the active slot. Only allowed on a store without a committed image.
+// The payload is written so the factory slot passes the same on-disk hash
+// verification as every later staged slot.
+func (s *Store) FactoryInit(init SlotState, payload []byte) error {
+	tx, err := s.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Abort()
 	if cur := s.inner.Slots[s.inner.ActiveSlot]; cur.Present {
 		return errors.New("device: factory init refused, committed firmware already present")
+	}
+	if len(payload) == 0 {
+		return errors.New("device: factory init needs a non-empty payload")
 	}
 	init.Present = true
 	if init.InstalledAt.IsZero() {
 		init.InstalledAt = time.Now().UTC()
 	}
-	if err := s.writeSlotFilesLocked(s.inner.ActiveSlot, init, nil, nil); err != nil {
+	if err := s.writeSlotFilesLocked(s.inner.ActiveSlot, init, payload, nil); err != nil {
 		return err
 	}
 	s.inner.Slots[s.inner.ActiveSlot] = init
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

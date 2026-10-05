@@ -65,7 +65,7 @@ func (r *apiRig) factoryInit() {
 	if err := r.st.FactoryInit(device.SlotState{
 		Model: model, Target: target, Version: 1,
 		PayloadHash: firmware.HashPayload([]byte("factory-v1")), InstalledAt: fixedNow.Add(-30 * day),
-	}); err != nil {
+	}, []byte("factory-v1")); err != nil {
 		r.t.Fatal(err)
 	}
 }

@@ -51,7 +51,7 @@ func setup(t *testing.T) *env {
 	if err := st.FactoryInit(device.SlotState{
 		Model: "dev1", Target: "app", Version: 1,
 		PayloadHash: firmware.HashPayload([]byte("v1")), InstalledAt: now.Add(-day),
-	}); err != nil {
+	}, []byte("v1")); err != nil {
 		t.Fatal(err)
 	}
 	return e

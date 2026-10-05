@@ -24,7 +24,7 @@ func round(t *testing.T, s *Store, v uint64) {
 func TestStageOverwritesRetainedPreviousWhenNoPending(t *testing.T) {
 	s, _ := openStore(t)
 	defer s.Close()
-	if err := s.FactoryInit(slot(1)); err != nil {
+	if err := s.FactoryInit(slot(1), []byte{byte(1)}); err != nil {
 		t.Fatal(err)
 	}
 	round(t, s, 2) // v1 retained as previous known-good
@@ -45,7 +45,7 @@ func TestStageOverwritesRetainedPreviousWhenNoPending(t *testing.T) {
 func TestStageConflictUsesSentinel(t *testing.T) {
 	s, _ := openStore(t)
 	defer s.Close()
-	_ = s.FactoryInit(slot(1))
+	_ = s.FactoryInit(slot(1), []byte{byte(1)})
 	if err := s.Stage(slot(2), []byte{2}); err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestStageConflictUsesSentinel(t *testing.T) {
 func TestRevertToRetainedPrevious(t *testing.T) {
 	s, _ := openStore(t)
 	defer s.Close()
-	_ = s.FactoryInit(slot(1))
+	_ = s.FactoryInit(slot(1), []byte{byte(1)})
 	round(t, s, 2)
 
 	if err := s.Revert(); err != nil {
@@ -85,7 +85,7 @@ func TestRevertToRetainedPrevious(t *testing.T) {
 func TestBootSweepsInterruptedHistoryCleanup(t *testing.T) {
 	s, dir := openStore(t)
 	defer s.Close()
-	_ = s.FactoryInit(slot(1))
+	_ = s.FactoryInit(slot(1), []byte{byte(1)})
 	round(t, s, 2) // committed v2, retained v1
 
 	// Crash while overwriting the retained v1 slot with v3 (after the slot
@@ -132,7 +132,7 @@ func TestBootSweepsInterruptedHistoryCleanup(t *testing.T) {
 func TestHistoryStaysBoundedOverManyRounds(t *testing.T) {
 	s, dir := openStore(t)
 	defer s.Close()
-	_ = s.FactoryInit(slot(1))
+	_ = s.FactoryInit(slot(1), []byte{byte(1)})
 	for v := uint64(2); v <= 12; v++ {
 		round(t, s, v)
 	}
@@ -149,7 +149,7 @@ func TestHistoryStaysBoundedOverManyRounds(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	sort.Strings(names)
-	want := []string{"slot-A.bin", "slot-A.json", "slot-B.bin", "slot-B.json", "state.json"}
+	want := []string{"slot-A.bin", "slot-A.json", "slot-B.bin", "slot-B.json", "state.json", "store.lock"}
 	if len(names) != len(want) {
 		t.Fatalf("on-disk files must stay bounded: got %v want %v", names, want)
 	}
